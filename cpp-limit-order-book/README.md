@@ -1,7 +1,6 @@
 # C++ Limit Order Book & Matching Engine
 
-A runnable portfolio demo of a single-instrument matching engine. It implements
-price-time priority for limit and market orders, constant-time active-order
+It implements price-time priority for limit and market orders, constant-time active-order
 lookup, cancellation and exchange-style modification semantics. A deterministic
 CSV replay, invariant checker, tests and microbenchmark make the behavior easy
 to inspect rather than leaving it as a code-only claim.
