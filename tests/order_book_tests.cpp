@@ -3,6 +3,8 @@
 #include <cstdlib>
 #include <functional>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -142,6 +144,32 @@ void invariants_hold_after_mixed_stream() {
     CHECK(book.verify(&error));
 }
 
+template <typename F>
+bool throws(F&& f) {
+    try {
+        f();
+    } catch (const std::exception&) {
+        return true;
+    }
+    return false;
+}
+
+void price_parsing() {
+    CHECK(lob::parse_price("100") == 10000);
+    CHECK(lob::parse_price("100.5") == 10050);
+    CHECK(lob::parse_price("100.05") == 10005);
+    CHECK(lob::parse_price("0.01") == 1);
+    CHECK(lob::format_price(10005) == "100.05");
+    CHECK(throws([] { lob::parse_price(""); }));
+    CHECK(throws([] { lob::parse_price("1.234"); }));
+    CHECK(throws([] { lob::parse_price("12a"); }));
+    // INT64_MAX ticks is the largest representable price; one more whole
+    // unit fits in int64 on its own but overflows once scaled to ticks.
+    CHECK(lob::parse_price("92233720368547758.07") == std::numeric_limits<lob::Price>::max());
+    CHECK(throws([] { lob::parse_price("92233720368547758.08"); }));
+    CHECK(throws([] { lob::parse_price("92233720368547759"); }));
+}
+
 } // namespace
 
 int main() {
@@ -157,6 +185,7 @@ int main() {
         {"duplicate active id rejected", rejects_duplicate_active_id},
         {"snapshot aggregates levels", snapshot_aggregates_levels},
         {"mixed-stream invariants", invariants_hold_after_mixed_stream},
+        {"price parsing", price_parsing},
     };
 
     for (const auto& [name, test] : tests) {

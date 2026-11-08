@@ -60,6 +60,9 @@ Price parse_price(const std::string& text) {
     if (fraction_digits == 1) {
         fraction *= 10;
     }
+    if (whole > (std::numeric_limits<Price>::max() - fraction) / 100) {
+        throw std::out_of_range("price is too large");
+    }
 
     const Price ticks = whole * 100 + fraction;
     return negative ? -ticks : ticks;
