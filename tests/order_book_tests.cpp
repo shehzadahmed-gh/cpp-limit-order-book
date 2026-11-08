@@ -1,9 +1,11 @@
 #include "order_book.hpp"
+#include "reference_book.hpp"
 
 #include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -170,6 +172,147 @@ void price_parsing() {
     CHECK(throws([] { lob::parse_price("92233720368547759"); }));
 }
 
+// ---------------------------------------------------------------------------
+// Randomized differential test against tests/reference_book.hpp.
+// ---------------------------------------------------------------------------
+
+bool same_trades(const std::vector<lob::Trade>& a, const std::vector<lob::Trade>& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].sequence != b[i].sequence || a[i].maker_id != b[i].maker_id ||
+            a[i].taker_id != b[i].taker_id || a[i].aggressor_side != b[i].aggressor_side ||
+            a[i].price != b[i].price || a[i].quantity != b[i].quantity) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool same_levels(const std::vector<lob::PriceLevelView>& a,
+                 const std::vector<lob::PriceLevelView>& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].price != b[i].price || a[i].total_quantity != b[i].total_quantity ||
+            a[i].orders.size() != b[i].orders.size()) {
+            return false;
+        }
+        for (std::size_t j = 0; j < a[i].orders.size(); ++j) {
+            const auto& x = a[i].orders[j];
+            const auto& y = b[i].orders[j];
+            if (x.id != y.id || x.quantity != y.quantity || x.priority != y.priority) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool same_stats(const lob::EngineStats& a, const lob::EngineStats& b) {
+    return a.accepted_orders == b.accepted_orders && a.rejected_orders == b.rejected_orders &&
+           a.cancelled_orders == b.cancelled_orders && a.modified_orders == b.modified_orders &&
+           a.trades == b.trades && a.matched_quantity == b.matched_quantity;
+}
+
+void run_against_reference(std::uint64_t seed, int steps) {
+    OrderBook book;
+    lob::reference::ReferenceBook ref;
+    std::mt19937_64 rng(seed);
+    std::vector<lob::OrderId> seen_ids;
+    lob::OrderId next_id = 1;
+
+    auto pick = [&](auto lo, auto hi) {
+        return std::uniform_int_distribution<decltype(hi - lo)>(lo, hi)(rng);
+    };
+    auto fail = [&](int step, const char* what) {
+        std::cerr << "reference mismatch (" << what << ") seed=" << seed << " step=" << step
+                  << '\n';
+        std::exit(1);
+    };
+    auto choose_id = [&]() -> lob::OrderId {
+        // Mostly fresh ids, sometimes an id we've used before (active or not),
+        // occasionally the invalid id 0.
+        const int roll = pick(0, 99);
+        if (roll < 2) return 0;
+        if (roll < 10 && !seen_ids.empty()) return seen_ids[pick(std::size_t{0}, seen_ids.size() - 1)];
+        seen_ids.push_back(next_id);
+        return next_id++;
+    };
+    auto choose_existing = [&]() -> lob::OrderId {
+        if (seen_ids.empty() || pick(0, 9) == 0) return 999'999'999;  // never issued
+        return seen_ids[pick(std::size_t{0}, seen_ids.size() - 1)];
+    };
+    auto choose_price = [&]() -> lob::Price {
+        if (pick(0, 199) == 0) return pick(-5, 0);  // invalid
+        return 9'990 + pick(0, 20);                 // tight band so orders cross often
+    };
+    auto choose_qty = [&]() -> lob::Quantity {
+        if (pick(0, 199) == 0) return 0;  // invalid
+        return pick(1, 50);
+    };
+
+    for (int step = 0; step < steps; ++step) {
+        const int action = pick(0, 99);
+        const Side side = pick(0, 1) ? Side::Buy : Side::Sell;
+        if (action < 50) {
+            const auto id = choose_id();
+            const auto price = choose_price();
+            const auto qty = choose_qty();
+            const auto a = book.add_limit(id, side, price, qty);
+            const auto b = ref.add_limit(id, side, price, qty);
+            if (a.accepted != b.accepted || a.rested != b.rested ||
+                a.unfilled_quantity != b.unfilled_quantity || !same_trades(a.trades, b.trades)) {
+                fail(step, "add_limit");
+            }
+        } else if (action < 60) {
+            const auto id = choose_id();
+            const auto qty = choose_qty();
+            const auto a = book.add_market(id, side, qty);
+            const auto b = ref.add_market(id, side, qty);
+            if (a.accepted != b.accepted || a.rested != b.rested ||
+                a.unfilled_quantity != b.unfilled_quantity || !same_trades(a.trades, b.trades)) {
+                fail(step, "add_market");
+            }
+        } else if (action < 82) {
+            const auto id = choose_existing();
+            if (book.cancel(id) != ref.cancel(id)) fail(step, "cancel");
+        } else {
+            const auto id = choose_existing();
+            const auto qty = choose_qty();
+            auto price = choose_price();
+            // Two times in three keep the current price, so the in-place
+            // (priority-preserving) path is exercised as well as re-queues.
+            if (pick(0, 2) != 0) {
+                if (const auto current = ref.price_of(id)) price = *current;
+            }
+            const auto a = book.modify(id, price, qty);
+            const auto b = ref.modify(id, price, qty);
+            if (a.effect != b.effect || a.rested != b.rested ||
+                a.unfilled_quantity != b.unfilled_quantity || !same_trades(a.trades, b.trades)) {
+                fail(step, "modify");
+            }
+        }
+
+        const auto mine = book.snapshot(std::numeric_limits<std::size_t>::max());
+        const auto theirs = ref.snapshot();
+        if (!same_levels(mine.bids, theirs.bids) || !same_levels(mine.asks, theirs.asks)) {
+            fail(step, "book state");
+        }
+        if (book.active_order_count() != ref.active_order_count()) fail(step, "order count");
+        if (!same_stats(book.stats(), ref.stats())) fail(step, "stats");
+        std::string error;
+        if (!book.verify(&error)) {
+            std::cerr << "invariant failed: " << error << '\n';
+            fail(step, "verify");
+        }
+    }
+}
+
+void matches_reference_model() {
+    for (std::uint64_t seed = 1; seed <= 25; ++seed) {
+        run_against_reference(seed, 4'000);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -186,6 +329,7 @@ int main() {
         {"snapshot aggregates levels", snapshot_aggregates_levels},
         {"mixed-stream invariants", invariants_hold_after_mixed_stream},
         {"price parsing", price_parsing},
+        {"matches reference model (25 seeds x 4000 ops)", matches_reference_model},
     };
 
     for (const auto& [name, test] : tests) {
